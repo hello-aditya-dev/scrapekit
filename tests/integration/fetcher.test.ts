@@ -78,7 +78,9 @@ describe('fetcher (integration)', () => {
 
   it('blocks redirects to private addresses (SSRF protection)', async () => {
     // A public seed must not be followed into a private/loopback address.
-    // We stub global fetch so the public URL returns a 302 to 127.0.0.1.
+    // We stub global fetch so the public URL returns a 302 to 127.0.0.1, and
+    // provide an ssrfChecker that allows the public host (so we reach the
+    // redirect-handling path, where the private destination is blocked).
     const originalFetch = globalThis.fetch;
     const fakeFetch = vi.fn(
       async () =>
@@ -92,6 +94,7 @@ describe('fetcher (integration)', () => {
       await expect(
         fetchDocument('https://public.example.com/page', {
           allowPrivateAddresses: false,
+          ssrfChecker: async () => ({ allowed: true, reason: 'stub-allow' }),
         }),
       ).rejects.toMatchObject({ code: 'REDIRECT_TO_PRIVATE_ADDRESS' });
     } finally {
@@ -158,6 +161,104 @@ describe('fetcher (integration)', () => {
       ).rejects.toMatchObject({ code: 'TOO_MANY_REDIRECTS' });
     } finally {
       await loopServer.close();
+    }
+  });
+
+  it('rejects responses exceeding maxBodyBytes', async () => {
+    const big: RouteConfig = {
+      routes: {
+        '/robots.txt': (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('User-agent: *\nAllow: /\n');
+        },
+        '/big': (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          // Write 64 KiB of data.
+          res.end('A'.repeat(64 * 1024));
+        },
+      },
+    };
+    const bigServer = await startTestServer(big);
+    try {
+      await expect(
+        fetchDocument(`${bigServer.url}/big`, {
+          allowPrivateAddresses: true,
+          maxBodyBytes: 1024,
+        }),
+      ).rejects.toMatchObject({ code: 'RESPONSE_TOO_LARGE' });
+    } finally {
+      await bigServer.close();
+    }
+  });
+
+  it('accepts responses within maxBodyBytes', async () => {
+    const small: RouteConfig = {
+      routes: {
+        '/robots.txt': (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('User-agent: *\nAllow: /\n');
+        },
+        '/small': (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('A'.repeat(500));
+        },
+      },
+    };
+    const smallServer = await startTestServer(small);
+    try {
+      const doc = await fetchDocument(`${smallServer.url}/small`, {
+        allowPrivateAddresses: true,
+        maxBodyBytes: 1024,
+      });
+      expect(doc.body.length).toBe(500);
+    } finally {
+      await smallServer.close();
+    }
+  });
+
+  it('blocks hostnames that resolve to private addresses (DNS SSRF)', async () => {
+    // Use the ssrfChecker hook to simulate a hostname resolving to 10.0.0.1.
+    await expect(
+      fetchDocument('https://internal.example/page', {
+        allowPrivateAddresses: false,
+        ssrfChecker: async () => ({
+          allowed: false,
+          reason: 'internal.example resolves to private address 10.0.0.1',
+        }),
+      }),
+    ).rejects.toMatchObject({ code: 'BLOCKED_PRIVATE_DESTINATION' });
+  });
+
+  it('distinguishes caller abort from timeout', async () => {
+    const controller = new AbortController();
+    const slowP = fetchDocument(`${server.url}/slow`, {
+      allowPrivateAddresses: true,
+      timeoutMs: 5000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 100);
+    await expect(slowP).rejects.toMatchObject({ code: 'ABORTED' });
+  });
+
+  it('blocks IPv4-mapped IPv6 loopback redirects', async () => {
+    const originalFetch = globalThis.fetch;
+    const fakeFetch = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: 'http://[::ffff:127.0.0.1]/admin' },
+        }),
+    );
+    globalThis.fetch = fakeFetch as unknown as typeof fetch;
+    try {
+      await expect(
+        fetchDocument('https://public.example/page', {
+          allowPrivateAddresses: false,
+          ssrfChecker: async () => ({ allowed: true, reason: 'stub-allow' }),
+        }),
+      ).rejects.toMatchObject({ code: 'REDIRECT_TO_PRIVATE_ADDRESS' });
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });

@@ -9,12 +9,26 @@
  */
 
 // Core utilities
-export { normalizeUrl, resolveUrl, isSameOrigin, isPrivateAddress, urlKey } from './core/url.js';
+export {
+  normalizeUrl,
+  resolveUrl,
+  isSameOrigin,
+  isPrivateAddress,
+  isPrivateIPv4,
+  urlKey,
+  hostOf,
+} from './core/url.js';
 
-export { fetchDocument, parseRetryAfter, DEFAULT_USER_AGENT } from './core/fetcher.js';
+export {
+  fetchDocument,
+  parseRetryAfter,
+  DEFAULT_USER_AGENT,
+  DEFAULT_MAX_BODY_BYTES,
+} from './core/fetcher.js';
 export { fetchPage, isRetriableError, RetryableStatusError } from './core/client.js';
 export { withRetry, computeBackoff, sleep } from './core/retry.js';
 export { loadRobots, robotsUrlFor, isAllowed, clearRobotsCache } from './core/robots.js';
+export type { RobotsResult } from './core/robots.js';
 export {
   loadHtml,
   extractMetadata,
@@ -23,6 +37,18 @@ export {
   buildExtractionResult,
 } from './core/extractor.js';
 export { crawl } from './core/crawler.js';
+export { checkDestination, isPrivateIpString } from './core/ssrf.js';
+export type { ResolvedAddress, DestinationCheckResult } from './core/ssrf.js';
+export {
+  validateCrawlerOptions,
+  validateFetcherOptions,
+  validateRetryOptions,
+} from './core/config.js';
+export type {
+  ValidatedCrawlerOptions,
+  ValidatedFetcherOptions,
+  ValidatedRetryOptions,
+} from './core/config.js';
 
 // Exporters
 export { toJson, writeJsonFile } from './exporters/json.js';

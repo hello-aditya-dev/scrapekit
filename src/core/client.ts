@@ -43,6 +43,7 @@ export function isRetriableError(error: unknown): boolean {
  * - 429 / 5xx → retried, then thrown as RetryableStatusError if exhausted.
  * - other 4xx → thrown immediately as ScrapeKitError (permanent).
  * - timeouts / network errors → retried, then thrown.
+ * - SSRF / invalid-URL / aborted → thrown immediately (never retried).
  */
 export async function fetchPage(
   url: string,

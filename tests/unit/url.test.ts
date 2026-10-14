@@ -110,6 +110,39 @@ describe('url utilities', () => {
       expect(isPrivateAddress('http://[fc00::1]/path')).toBe(true);
       expect(isPrivateAddress('http://[fd12::1]/path')).toBe(true);
     });
+    it('detects IPv4-mapped IPv6 (loopback)', () => {
+      expect(isPrivateAddress('http://[::ffff:127.0.0.1]/path')).toBe(true);
+      expect(isPrivateAddress('http://[::ffff:7f00:1]/path')).toBe(true);
+      expect(isPrivateAddress('http://[0:0:0:0:0:ffff:7f00:1]/path')).toBe(true);
+    });
+    it('detects IPv4-mapped IPv6 (private ranges)', () => {
+      expect(isPrivateAddress('http://[::ffff:10.0.0.1]/path')).toBe(true);
+      expect(isPrivateAddress('http://[::ffff:192.168.1.1]/path')).toBe(true);
+      expect(isPrivateAddress('http://[::ffff:172.16.0.1]/path')).toBe(true);
+    });
+    it('does not flag IPv4-mapped public IPv6', () => {
+      expect(isPrivateAddress('http://[::ffff:8.8.8.8]/path')).toBe(false);
+      expect(isPrivateAddress('http://[::ffff:0808:0808]/path')).toBe(false);
+    });
+    it('detects the unspecified address ::', () => {
+      expect(isPrivateAddress('http://[::]/path')).toBe(true);
+    });
+    it('detects 0.0.0.0/8', () => {
+      expect(isPrivateAddress('http://0.0.0.0/path')).toBe(true);
+      expect(isPrivateAddress('http://0.1.2.3/path')).toBe(true);
+    });
+    it('detects CGNAT 100.64/10', () => {
+      expect(isPrivateAddress('http://100.64.0.1/path')).toBe(true);
+      expect(isPrivateAddress('http://100.127.255.255/path')).toBe(true);
+      expect(isPrivateAddress('http://100.128.0.1/path')).toBe(false);
+    });
+    it('detects documentation/benchmarking ranges', () => {
+      expect(isPrivateAddress('http://192.0.2.1/path')).toBe(true); // TEST-NET-1
+      expect(isPrivateAddress('http://198.51.100.1/path')).toBe(true); // TEST-NET-2
+      expect(isPrivateAddress('http://203.0.113.1/path')).toBe(true); // TEST-NET-3
+      expect(isPrivateAddress('http://198.18.0.1/path')).toBe(true); // benchmarking
+      expect(isPrivateAddress('http://198.19.0.1/path')).toBe(true); // benchmarking
+    });
     it('does not flag public addresses', () => {
       expect(isPrivateAddress('https://example.com/path')).toBe(false);
       expect(isPrivateAddress('http://93.184.216.34/path')).toBe(false);

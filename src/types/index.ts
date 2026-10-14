@@ -68,6 +68,8 @@ export interface CrawlResult {
   visited: number;
   /** Number of pages that were skipped (robots, depth, dedupe, errors). */
   skipped: number;
+  /** Number of HTTP requests actually started (may be > visited due to robots skips, aborts, etc.). */
+  attempted: number;
   /** Duration of the crawl in milliseconds. */
   durationMs: number;
 }
@@ -84,6 +86,19 @@ export interface FetcherOptions {
   signal?: AbortSignal;
   /** Allow requests to private/loopback addresses. Default: false. */
   allowPrivateAddresses?: boolean;
+  /**
+   * Maximum response body size in bytes. Bodies larger than this are rejected
+   * with a `RESPONSE_TOO_LARGE` error to prevent memory exhaustion. The body
+   * is still read but truncated; callers should treat the body as partial.
+   * Default: 5 * 1024 * 1024 (5 MiB).
+   */
+  maxBodyBytes?: number;
+  /**
+   * Optional override for the SSRF destination check (advanced/testing).
+   * When provided, this function is called instead of the default DNS-resolving
+   * check. Returning `{ allowed: false }` blocks the request.
+   */
+  ssrfChecker?: (hostname: string) => Promise<{ allowed: boolean; reason: string }>;
 }
 
 /** Configuration for retry behaviour. */

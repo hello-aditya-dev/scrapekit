@@ -2,21 +2,32 @@
  * HTTP fetcher.
  *
  * Wraps the global `fetch` with:
- *  - request timeouts via AbortController,
- *  - manual redirect handling with bounded hops and private-address checks,
- *  - SSRF protection (private/loopback destinations blocked by default),
+ *  - request timeouts via AbortController (distinct from caller cancellation),
+ *  - manual redirect handling with bounded hops,
+ *  - SSRF protection: syntactic private-address checks AND DNS resolution of
+ *    hostnames to reject destinations that resolve to private/non-public IPs,
  *  - 429 / Retry-After detection,
+ *  - response-body size limits to prevent memory exhaustion,
  *  - a descriptive User-Agent.
  *
  * The fetcher is intentionally "dumb" about retries: retry orchestration is
  * handled by `retry.ts` so that the crawler and CLI can share the same policy.
+ *
+ * SSRF note: the DNS check is a time-of-check guard. Node's `fetch` does not
+ * expose a way to pin the resolved address, so a DNS-rebinding attacker with
+ * control of the authoritative server could theoretically change the record
+ * between the check and the connection. This is a residual risk documented in
+ * SECURITY.md; the check still blocks the vast majority of accidental and
+ * naive SSRF attempts.
  */
 import { ScrapeKitError, type FetcherOptions, type FetchedDocument } from '../types/index.js';
 import { isPrivateAddress, normalizeUrl } from './url.js';
+import { checkDestination } from './ssrf.js';
 
 export const DEFAULT_USER_AGENT = 'ScrapeKit/0.1 (+https://github.com/hello-aditya-dev/scrapekit)';
 export const DEFAULT_TIMEOUT_MS = 15000;
 export const DEFAULT_MAX_REDIRECTS = 5;
+export const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MiB
 
 /**
  * Fetch a URL and return the final document.
@@ -24,11 +35,14 @@ export const DEFAULT_MAX_REDIRECTS = 5;
  * Throws ScrapeKitError with a stable `code` for each failure mode:
  *  - INVALID_URL
  *  - BLOCKED_PRIVATE_ADDRESS
+ *  - BLOCKED_PRIVATE_DESTINATION (DNS-resolved private address)
  *  - TIMEOUT
+ *  - ABORTED (caller cancelled)
  *  - TOO_MANY_REDIRECTS
  *  - REDIRECT_TO_PRIVATE_ADDRESS
  *  - HTTP_ERROR (for 4xx/5xx after redirects are exhausted)
  *  - NETWORK_ERROR
+ *  - RESPONSE_TOO_LARGE
  */
 export async function fetchDocument(
   input: string,
@@ -38,6 +52,7 @@ export async function fetchDocument(
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
   const allowPrivate = options.allowPrivateAddresses ?? false;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   let currentUrl: string;
   try {
@@ -55,19 +70,41 @@ export async function fetchDocument(
     );
   }
 
-  const timeoutController = new AbortController();
-  const timeoutTimer = setTimeout(() => timeoutController.abort(), timeoutMs);
-  // Link the caller's signal to the timeout controller so either can cancel.
+  // Track whether the *caller* cancelled, so we can distinguish TIMEOUT from ABORTED.
   const callerSignal = options.signal;
-  const onCallerAbort = () => timeoutController.abort();
+  let callerAborted = false;
+  const timeoutController = new AbortController();
+  const onCallerAbort = () => {
+    callerAborted = true;
+    timeoutController.abort();
+  };
   if (callerSignal) {
-    if (callerSignal.aborted) timeoutController.abort();
-    else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    if (callerSignal.aborted) {
+      callerAborted = true;
+      timeoutController.abort();
+    } else {
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
   }
+  const timeoutTimer = setTimeout(() => timeoutController.abort(), timeoutMs);
 
   try {
     let redirects = 0;
     while (true) {
+      // DNS-based SSRF check for the current URL's host (covers hostnames that
+      // resolve to private IPs and rebinding-style attacks at the syntactic level).
+      if (!allowPrivate) {
+        const checker =
+          options.ssrfChecker ?? ((h: string) => checkDestination(h, { allowPrivate: false }));
+        const dest = await checker(new URL(currentUrl).hostname);
+        if (!dest.allowed) {
+          throw new ScrapeKitError(
+            `Refusing to fetch "${currentUrl}": ${dest.reason}.`,
+            'BLOCKED_PRIVATE_DESTINATION',
+          );
+        }
+      }
+
       let response: Response;
       try {
         response = await fetch(currentUrl, {
@@ -81,9 +118,15 @@ export async function fetchDocument(
           },
         });
       } catch (err) {
+        if (callerAborted) {
+          throw new ScrapeKitError(
+            `Request to "${currentUrl}" was aborted by the caller.`,
+            'ABORTED',
+          );
+        }
         if (timeoutController.signal.aborted) {
           throw new ScrapeKitError(
-            `Request to "${currentUrl}" timed out or was aborted after ${timeoutMs}ms.`,
+            `Request to "${currentUrl}" timed out after ${timeoutMs}ms.`,
             'TIMEOUT',
           );
         }
@@ -130,12 +173,7 @@ export async function fetchDocument(
         continue;
       }
 
-      const body = await response.text().catch((err: unknown) => {
-        throw new ScrapeKitError(
-          `Failed to read response body from "${currentUrl}": ${(err as Error).message}`,
-          'NETWORK_ERROR',
-        );
-      });
+      const body = await readBodyWithLimit(response, maxBodyBytes, currentUrl);
 
       const rateLimited = response.status === 429;
       let retryAfterMs: number | undefined;
@@ -155,6 +193,69 @@ export async function fetchDocument(
     clearTimeout(timeoutTimer);
     if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
   }
+}
+
+/** Read the response body with a byte limit to prevent memory exhaustion. */
+async function readBodyWithLimit(
+  response: Response,
+  maxBytes: number,
+  url: string,
+): Promise<string> {
+  if (!response.body) {
+    // No streaming body — fall back to .text() (bounded by server content if any).
+    return response.text().catch((err: unknown) => {
+      throw new ScrapeKitError(
+        `Failed to read response body from "${url}": ${(err as Error).message}`,
+        'NETWORK_ERROR',
+      );
+    });
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let received = 0;
+  let result = '';
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (received + value.length > maxBytes) {
+        // Take only the portion that fits, then stop.
+        const remaining = maxBytes - received;
+        if (remaining > 0) {
+          result += decoder.decode(value.subarray(0, remaining), { stream: true });
+        }
+        truncated = true;
+        break;
+      }
+      received += value.length;
+      result += decoder.decode(value, { stream: true });
+    }
+    result += decoder.decode(); // flush
+  } catch (err) {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+    throw new ScrapeKitError(
+      `Failed to read response body from "${url}": ${(err as Error).message}`,
+      'NETWORK_ERROR',
+    );
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  }
+  if (truncated) {
+    throw new ScrapeKitError(
+      `Response body from "${url}" exceeded the ${maxBytes}-byte limit.`,
+      'RESPONSE_TOO_LARGE',
+    );
+  }
+  return result;
 }
 
 /**

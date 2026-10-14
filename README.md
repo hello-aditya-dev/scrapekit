@@ -76,8 +76,10 @@ your internal network.
 - **Structured metadata**: page title, meta description, canonical URL, grouped
   headings (`h1`–`h6`), and same-origin internal links.
 - **Exports**: JSON (pretty, UTF-8) and CSV (RFC 4180 escaping, stable schema).
-- **Safe defaults**: private/loopback addresses are blocked by default to
-  prevent SSRF-style mistakes; a descriptive `User-Agent` identifies the tool.
+- **Safe defaults**: private/loopback addresses are blocked by default, with
+  both syntactic checks and DNS resolution of hostnames to reject destinations
+  that resolve to non-public IPs. A response-body size limit (5 MiB default)
+  prevents memory exhaustion.
 - **Typed library API**: the same modules the CLI uses are exported as a stable
   TypeScript API.
 
@@ -169,6 +171,7 @@ Options:
   --user-agent <ua>          Override the User-Agent string.
   --allow-private            Allow fetching private/loopback addresses (local testing).
   --max-retries <n>          Maximum retry attempts for transient failures. (default: 3)
+  --max-body-bytes <n>       Maximum response body size in bytes. (default: 5242880)
 ```
 
 ### `scrapekit extract`
@@ -189,6 +192,7 @@ Options:
   --user-agent <ua>          Override the User-Agent string.
   --allow-private            Allow fetching private/loopback addresses (local testing).
   --max-retries <n>          Maximum retry attempts for transient failures. (default: 3)
+  --max-body-bytes <n>       Maximum response body size in bytes. (default: 5242880)
 ```
 
 ### `scrapekit crawl`
@@ -210,6 +214,7 @@ Options:
   --allow-private      Allow crawling private/loopback addresses (local testing).
   --no-robots          Do not respect robots.txt (not recommended).
   --max-retries <n>    Maximum retry attempts for transient failures. (default: 3)
+  --max-body-bytes <n> Maximum response body size in bytes. (default: 5242880)
 ```
 
 ## Sample output
@@ -320,19 +325,21 @@ Errors are typed as `ScrapeKitError` with a stable `code` (`INVALID_URL`,
 src/
   cli/
     index.ts           CLI entry point (Commander)
-    output.ts          shared output/summary helpers
+    output.ts          shared output/summary/argument helpers
     commands/
       inspect.ts       `scrapekit inspect`
       extract.ts       `scrapekit extract`
       crawl.ts         `scrapekit crawl`
   core/
-    url.ts             URL normalization, same-origin, private-address checks
+    url.ts             URL normalization, same-origin, syntactic private-address checks
+    ssrf.ts            DNS-resolving destination validation for SSRF protection
+    config.ts          boundary validation of crawler/fetcher/retry options
     retry.ts           exponential backoff + jitter, Retry-After awareness
-    fetcher.ts         raw HTTP fetch: timeout, manual redirects, SSRF guard
+    fetcher.ts         raw HTTP fetch: timeout, manual redirects, SSRF guard, body limit
     client.ts          fetcher + retry composition (fetchPage)
     robots.ts          robots.txt fetch + cache + isAllowed
     extractor.ts       Cheerio-based metadata + selector extraction
-    crawler.ts         conservative same-origin BFS crawler
+    crawler.ts         conservative same-origin BFS crawler with async rate gate
   exporters/
     json.ts            JSON serialization + file writer
     csv.ts             RFC 4180 CSV escaping + file writer
@@ -353,31 +360,35 @@ Design principles:
 
 ## Testing
 
-ScrapeKit has a meaningful test suite (117 tests across 9 files) that does not
+ScrapeKit has a meaningful test suite (182 tests across 11 files) that does not
 depend on third-party websites. Integration tests spin up a local HTTP fixture
 server so CI is hermetic.
 
 ```bash
 npm run lint        # ESLint
 npm run typecheck   # tsc --noEmit
-npm test            # Vitest (117 tests)
+npm test            # Vitest (182 tests)
 npm run build       # tsc → dist/
 ```
 
 All four must pass. The suite covers:
 
-- URL normalization, same-origin checks, private-address detection
+- URL normalization, same-origin checks, private-address detection (including
+  IPv4-mapped IPv6, CGNAT, documentation/benchmarking ranges)
+- SSRF destination validation: IP literals, localhost hostnames, DNS resolution
+  to private addresses, mixed-address blocking, DNS failures
 - HTML selection, text extraction, attribute extraction, missing selectors
 - CSV escaping (commas, quotes, newlines, nested objects) and JSON export
 - Retry behavior, backoff bounds, `Retry-After` honoring, abort handling
 - `robots.txt` allowed / disallowed paths and user-agent rules
 - Fetcher timeout, 429 + `Retry-After` parsing, redirect-to-private blocking,
-  too-many-redirects enforcement
+  too-many-redirects enforcement, response-size limits, caller-abort vs timeout
 - Crawler: depth enforcement, max-page enforcement, dedupe, robots blocking,
-  external-origin exclusion, error recording
+  external-origin exclusion, error recording, concurrency validation,
+  cross-worker request spacing, graceful cancellation, statistics accuracy
 - End-to-end CLI tests (help, version, inspect, extract, crawl, CSV/JSON
-  export, invalid-URL rejection, file-write failures) against the local fixture
-  server
+  export, invalid-URL/format/value rejection, file-write failures, Unicode,
+  empty results, file overwrite) against the local fixture server
 
 ## Responsible scraping
 
@@ -390,11 +401,25 @@ ScrapeKit is built for _responsible_ extraction from _public_ pages. By design:
   defaults.
 - It **does not retry permanent client errors** (e.g. `403`, `404`) — only
   transient failures (`429`, `5xx`, timeouts, network errors).
-- It **blocks private/loopback addresses by default** to prevent accidental
-  SSRF against internal services. Opt out only for local testing
-  (`--allow-private`).
+- It **blocks private/loopback destinations by default** using two layers: a
+  syntactic check of the URL host (covering IPv4/IPv6 literals, `localhost`,
+  IPv4-mapped IPv6, RFC 1918, CGNAT, link-local, and documentation ranges) and
+  a DNS-resolution check that rejects hostnames whose `A`/`AAAA` records
+  resolve to any non-public address. Redirects are checked at each hop. Opt
+  out only for local testing (`--allow-private`). A response-body size limit
+  (5 MiB default, configurable via `--max-body-bytes`) guards against memory
+  exhaustion from oversized responses.
 - It does **not** implement CAPTCHA bypass, credential attacks, browser
   fingerprint spoofing, or any technique intended to evade access controls.
+
+**SSRF residual risk (honestly disclosed):** the DNS check is a time-of-check
+guard. Node's `fetch` does not expose a way to pin the resolved address, so a
+determined attacker with control of an authoritative DNS server could
+theoretically rebind the record between the check and the connection (DNS
+rebinding / TOCTOU). The implemented controls block the overwhelming majority of
+accidental and naive-malicious SSRF attempts, including `localhost`, RFC 1918
+ranges, link-local, IPv4-mapped IPv6, and hostnames that resolve to any of
+those. This is best-effort SSRF mitigation, not a complete defense.
 
 Always check a site's `robots.txt` and Terms of Service, rate-limit yourself,
 and avoid scraping behind authentication or in violation of applicable law.
@@ -408,6 +433,10 @@ and avoid scraping behind authentication or in violation of applicable law.
 - `robots.txt` is cached per origin for 30 minutes; long-running processes may
   need to call `clearRobotsCache()` to pick up changes.
 - `Retry-After` as an HTTP-date is parsed best-effort.
+- SSRF protection is best-effort: syntactic host checks plus a time-of-check
+  DNS resolution. DNS rebinding (TOCTOU) is a residual risk that cannot be
+  fully eliminated without pinning the resolved IP at the socket layer, which
+  Node's `fetch` does not support.
 - The tool targets publicly accessible pages; it is not a general-purpose
   authenticated crawling framework.
 

@@ -232,4 +232,158 @@ describe('CLI end-to-end', () => {
     expect(r.code).not.toBe(0);
     expect(r.stderr.toLowerCase()).toContain('output');
   });
+
+  it('rejects an invalid --format value (does not silently substitute json)', async () => {
+    const r = await runCli([
+      'inspect',
+      `${server.url}/`,
+      '--allow-private',
+      '--format',
+      'xml',
+      '--timeout-ms',
+      '4000',
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--format');
+    expect(r.stderr.toLowerCase()).toContain('json');
+  });
+
+  it('rejects --concurrency 0 for crawl', async () => {
+    const r = await runCli([
+      'crawl',
+      `${server.url}/`,
+      '--concurrency',
+      '0',
+      '--allow-private',
+      '--timeout-ms',
+      '1000',
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--concurrency');
+    expect(r.stderr).toContain('>= 1');
+  });
+
+  it('rejects --max-pages 0 for crawl', async () => {
+    const r = await runCli(['crawl', `${server.url}/`, '--max-pages', '0', '--allow-private']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--max-pages');
+  });
+
+  it('rejects --timeout-ms 0', async () => {
+    const r = await runCli(['inspect', `${server.url}/`, '--allow-private', '--timeout-ms', '0']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--timeout-ms');
+  });
+
+  it('rejects negative --delay-ms', async () => {
+    const r = await runCli(['crawl', `${server.url}/`, '--delay-ms', '-5', '--allow-private']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--delay-ms');
+  });
+
+  it('rejects a non-numeric --concurrency', async () => {
+    const r = await runCli(['crawl', `${server.url}/`, '--concurrency', 'abc', '--allow-private']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('--concurrency');
+  });
+
+  it('handles Unicode content correctly in inspect metadata', async () => {
+    const r = await runCli([
+      'inspect',
+      `${server.url}/`,
+      '--allow-private',
+      '--format',
+      'json',
+      '--timeout-ms',
+      '4000',
+    ]);
+    expect(r.code).toBe(0);
+    // The fixture <title> contains an em dash (—).
+    expect(r.stdout).toContain('Example — ScrapeKit Fixture');
+  });
+
+  it('handles an empty result set gracefully', async () => {
+    const r = await runCli([
+      'extract',
+      `${server.url}/`,
+      '--selector',
+      '.does-not-exist',
+      '--allow-private',
+      '--format',
+      'json',
+      '--timeout-ms',
+      '4000',
+    ]);
+    expect(r.code).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.items).toEqual([]);
+  });
+
+  it('extract CSV with special characters is correctly escaped', async () => {
+    // Build a fixture page with text containing commas, quotes, newlines.
+    const { startTestServer } = await import('../fixtures/server.js');
+    const special = await startTestServer({
+      routes: {
+        '/robots.txt': (_req, res) => {
+          res.writeHead(200);
+          res.end('User-agent: *\nAllow: /\n');
+        },
+        '/': (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(
+            '<html><body>' +
+              '<p class="x">hello, world</p>' +
+              '<p class="x">say "hi"</p>' +
+              '<p class="x">line1\nline2</p>' +
+              '</body></html>',
+          );
+        },
+      },
+    });
+    try {
+      const outFile = join(tmpDir, 'special.csv');
+      const r = await runCli([
+        'extract',
+        `${special.url}/`,
+        '--selector',
+        '.x',
+        '--allow-private',
+        '--format',
+        'csv',
+        '--output',
+        outFile,
+        '--timeout-ms',
+        '4000',
+      ]);
+      expect(r.code).toBe(0);
+      const content = await readFile(outFile, 'utf8');
+      const lines = content.split('\r\n');
+      expect(lines[0]).toBe('url,selector,attribute,index,text,value');
+      // Each special-character field must be quoted.
+      expect(content).toContain('"hello, world"');
+      expect(content).toContain('"say ""hi"""');
+      expect(content).toContain('"line1\nline2"');
+    } finally {
+      await special.close();
+    }
+  });
+
+  it('overwrites an existing output file', async () => {
+    const outFile = join(tmpDir, 'overwrite.json');
+    await writeFile(outFile, 'OLD CONTENT');
+    const r = await runCli([
+      'inspect',
+      `${server.url}/`,
+      '--allow-private',
+      '--output',
+      outFile,
+      '--timeout-ms',
+      '4000',
+    ]);
+    expect(r.code).toBe(0);
+    const content = await readFile(outFile, 'utf8');
+    const parsed = JSON.parse(content);
+    expect(parsed.metadata.title).toBe('Example — ScrapeKit Fixture');
+    expect(content).not.toContain('OLD CONTENT');
+  });
 });

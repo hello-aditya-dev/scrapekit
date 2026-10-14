@@ -29,6 +29,8 @@ export default [
         URL: 'readonly',
         URLSearchParams: 'readonly',
         Buffer: 'readonly',
+        TextDecoder: 'readonly',
+        TextEncoder: 'readonly',
         NodeJS: 'readonly',
       },
     },

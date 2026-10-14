@@ -147,6 +147,154 @@ describe('crawler (integration)', () => {
     const external = result.pages.find((p) => !p.url.startsWith(server.url));
     expect(external).toBeUndefined();
   });
+
+  it('rejects concurrency 0 with INVALID_CONFIG', async () => {
+    await expect(
+      crawl(`${server.url}/`, {
+        concurrency: 0,
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
+
+  it('rejects negative concurrency', async () => {
+    await expect(
+      crawl(`${server.url}/`, {
+        concurrency: -1,
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
+
+  it('rejects maxPages 0', async () => {
+    await expect(
+      crawl(`${server.url}/`, {
+        maxPages: 0,
+        allowPrivateAddresses: true,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
+
+  it('enforces request spacing across concurrent workers', async () => {
+    // A page with many same-origin children so multiple workers compete.
+    const manyLinks: RouteConfig = defaultRoutes();
+    manyLinks.routes['/'] = (_req, res) => {
+      let body = '<html><body>';
+      for (let i = 0; i < 8; i++) body += `<a href="/p${i}">p${i}</a>`;
+      body += '</body></html>';
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(body);
+    };
+    for (let i = 0; i < 8; i++) {
+      const idx = i;
+      manyLinks.routes[`/p${idx}`] = (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(`<html><body><h1>p${idx}</h1></body></html>`);
+      };
+    }
+    const localServer = await startTestServer(manyLinks);
+    const timestamps: number[] = [];
+    const original = localServer;
+    // Wrap by intercepting via a custom route: we re-create server with a
+    // handler that records timestamps.
+    await localServer.close();
+    const recordingServer = await startTestServer({
+      routes: Object.fromEntries(
+        Object.entries(manyLinks.routes).map(([path, _h]) => [
+          path,
+          (_req, res) => {
+            if (path === '/robots.txt') {
+              res.writeHead(200);
+              res.end('User-agent: *\nAllow: /\n');
+              return;
+            }
+            timestamps.push(Date.now());
+            if (path === '/') {
+              let body = '<html><body>';
+              for (let i = 0; i < 8; i++) body += `<a href="/p${i}">p${i}</a>`;
+              body += '</body></html>';
+              res.writeHead(200, { 'content-type': 'text/html' });
+              res.end(body);
+            } else {
+              res.writeHead(200, { 'content-type': 'text/html' });
+              res.end(`<html><body><h1>${path}</h1></body></html>`);
+            }
+          },
+        ]),
+      ),
+    });
+    void original;
+    try {
+      const DELAY = 120;
+      const result = await crawl(`${recordingServer.url}/`, {
+        maxPages: 9,
+        maxDepth: 1,
+        delayMs: DELAY,
+        concurrency: 4,
+        allowPrivateAddresses: true,
+        fetcher: { timeoutMs: 3000 },
+      });
+      expect(result.visited).toBe(9);
+      // Sort timestamps and verify minimum gap between consecutive requests.
+      const sorted = [...timestamps].sort((a, b) => a - b);
+      const gaps: number[] = [];
+      for (let i = 1; i < sorted.length; i++) gaps.push(sorted[i]! - sorted[i - 1]!);
+      const minGap = Math.min(...gaps);
+      // Tolerate ~40ms of scheduling jitter; the bug produced 0–5ms gaps.
+      expect(minGap).toBeGreaterThanOrEqual(DELAY - 50);
+    } finally {
+      await recordingServer.close();
+    }
+  });
+
+  it('cancels gracefully via AbortSignal', async () => {
+    const slow: RouteConfig = defaultRoutes({
+      extraRoutes: {
+        '/slow-page': (_req, res) => {
+          setTimeout(() => {
+            res.writeHead(200);
+            res.end('<html></html>');
+          }, 3000);
+        },
+      },
+    });
+    slow.routes['/'] = (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><body><a href="/slow-page">slow</a></body></html>');
+    };
+    const localServer = await startTestServer(slow);
+    try {
+      const controller = new AbortController();
+      const crawlP = crawl(`${localServer.url}/`, {
+        maxPages: 5,
+        maxDepth: 1,
+        delayMs: 5,
+        concurrency: 1,
+        allowPrivateAddresses: true,
+        signal: controller.signal,
+        fetcher: { timeoutMs: 5000 },
+      });
+      // Abort shortly after the seed fetch begins.
+      setTimeout(() => controller.abort(), 200);
+      const result = await crawlP;
+      // The crawl must resolve (not hang) and report partial results.
+      expect(result.durationMs).toBeLessThan(5000);
+    } finally {
+      await localServer.close();
+    }
+  });
+
+  it('reports attempted count in the result', async () => {
+    const result = await crawl(`${server.url}/`, {
+      maxPages: 3,
+      maxDepth: 1,
+      delayMs: 5,
+      concurrency: 2,
+      allowPrivateAddresses: true,
+    });
+    expect(result.attempted).toBeGreaterThan(0);
+    expect(result.attempted).toBeGreaterThanOrEqual(result.visited);
+  });
 });
 
 describe('client (integration)', () => {

@@ -5,21 +5,28 @@
 import type { Command } from 'commander';
 import { crawl } from '../../core/crawler.js';
 import { DEFAULT_USER_AGENT } from '../../core/fetcher.js';
-import type { ExportFormat } from '../../types/index.js';
-import { failWithError, writeOutput, printSummary } from '../output.js';
+import {
+  failWithError,
+  writeOutput,
+  printSummary,
+  parseFormat,
+  parseNonNegInt,
+  parsePosInt,
+} from '../output.js';
 
 export interface CrawlOptions {
   maxPages: number;
   maxDepth: number;
   delayMs: number;
   concurrency: number;
-  format: ExportFormat;
+  format: 'json' | 'csv';
   output?: string;
   timeoutMs: number;
   userAgent: string;
   allowPrivate: boolean;
   noRobots: boolean;
   maxRetries: number;
+  maxBodyBytes: number;
 }
 
 export function registerCrawlCommand(program: Command): void {
@@ -29,7 +36,7 @@ export function registerCrawlCommand(program: Command): void {
     .argument('<url>', 'Seed absolute http(s) URL to crawl from.')
     .option('--max-pages <n>', 'Maximum number of pages to visit.', '10')
     .option('--depth <n>', 'Maximum crawl depth (seed page is depth 0).', '2')
-    .option('--delay-ms <ms>', 'Delay between requests to the same host (ms).', '1000')
+    .option('--delay-ms <ms>', 'Delay between request starts to the same host (ms).', '1000')
     .option('--concurrency <n>', 'Maximum concurrent in-flight requests.', '2')
     .option('-f, --format <format>', 'Output format: json or csv.', 'json')
     .option('-o, --output <path>', 'Write output to a file instead of stdout.')
@@ -38,21 +45,22 @@ export function registerCrawlCommand(program: Command): void {
     .option('--allow-private', 'Allow crawling private/loopback addresses (local testing).', false)
     .option('--no-robots', 'Do not respect robots.txt (not recommended).')
     .option('--max-retries <n>', 'Maximum retry attempts for transient failures.', '3')
+    .option('--max-body-bytes <n>', 'Maximum response body size in bytes.', String(5 * 1024 * 1024))
     .action(async (url: string, opts: Record<string, string | boolean>) => {
       try {
-        const format = (opts.format === 'csv' ? 'csv' : 'json') as ExportFormat;
         const options: CrawlOptions = {
-          maxPages: parsePositiveInt(opts.maxPages, 10, '--max-pages'),
-          maxDepth: parsePositiveInt(opts.depth, 2, '--depth'),
-          delayMs: parsePositiveInt(opts.delayMs, 1000, '--delay-ms'),
-          concurrency: parsePositiveInt(opts.concurrency, 2, '--concurrency'),
-          format,
+          maxPages: parsePosInt(opts.maxPages, 10, '--max-pages', 10_000),
+          maxDepth: parseNonNegInt(opts.depth, 2, '--depth', 32),
+          delayMs: parseNonNegInt(opts.delayMs, 1000, '--delay-ms', 3_600_000),
+          concurrency: parsePosInt(opts.concurrency, 2, '--concurrency', 64),
+          format: parseFormat(opts.format),
           output: typeof opts.output === 'string' ? opts.output : undefined,
-          timeoutMs: parsePositiveInt(opts.timeoutMs, 15000, '--timeout-ms'),
+          timeoutMs: parsePosInt(opts.timeoutMs, 15000, '--timeout-ms', 3_600_000),
           userAgent: typeof opts.userAgent === 'string' ? opts.userAgent : DEFAULT_USER_AGENT,
           allowPrivate: opts.allowPrivate === true,
           noRobots: opts.robots === false,
-          maxRetries: parsePositiveInt(opts.maxRetries, 3, '--max-retries'),
+          maxRetries: parseNonNegInt(opts.maxRetries, 3, '--max-retries', 100),
+          maxBodyBytes: parsePosInt(opts.maxBodyBytes, 5 * 1024 * 1024, '--max-body-bytes'),
         };
 
         const result = await crawl(url, {
@@ -66,6 +74,7 @@ export function registerCrawlCommand(program: Command): void {
             timeoutMs: options.timeoutMs,
             userAgent: options.userAgent,
             allowPrivateAddresses: options.allowPrivate,
+            maxBodyBytes: options.maxBodyBytes,
           },
           retry: { maxRetries: options.maxRetries },
         });
@@ -83,24 +92,18 @@ export function registerCrawlCommand(program: Command): void {
           error: p.error ?? '',
         }));
 
-        writeOutput(format === 'csv' ? csvRows : result, { format, output: options.output });
+        writeOutput(options.format === 'csv' ? csvRows : result, {
+          format: options.format,
+          output: options.output,
+        });
         printSummary(
           `Crawled ${result.visited} page${result.visited === 1 ? '' : 's'} ` +
-            `(${result.skipped} skipped) from ${result.seed} in ${result.durationMs}ms.` +
+            `(${result.skipped} skipped, ${result.attempted} request${result.attempted === 1 ? '' : 's'} attempted) ` +
+            `from ${result.seed} in ${result.durationMs}ms.` +
             (options.output ? ` Output written to ${options.output}.` : ''),
         );
       } catch (err) {
         failWithError(err);
       }
     });
-}
-
-function parsePositiveInt(value: unknown, fallback: number, flag: string): number {
-  if (value === undefined || value === null || value === '') return fallback;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) {
-    process.stderr.write(`Error: ${flag} must be a non-negative integer (got "${value}").\n`);
-    process.exit(2);
-  }
-  return n;
 }

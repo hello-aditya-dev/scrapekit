@@ -5,9 +5,11 @@
  *  - Stay on the seed origin (same-origin only).
  *  - Respect robots.txt.
  *  - Bound work via maxPages, maxDepth, delayMs, concurrency.
- *  - Be polite: a single-host delay between successive requests.
+ *  - Be polite: enforce a minimum spacing between request *starts* to the same
+ *    host, even under concurrency (via an async gate).
  *  - Avoid private/loopback destinations unless explicitly allowed.
  *  - Graceful cancellation via AbortSignal.
+ *  - Accurate statistics and deterministic page ordering.
  */
 import type { CrawlResult, CrawledPage, CrawlerOptions, FetcherOptions } from '../types/index.js';
 import { fetchPage } from './client.js';
@@ -15,20 +17,83 @@ import { extractMetadata } from './extractor.js';
 import { loadRobots, isAllowed } from './robots.js';
 import { isSameOrigin, normalizeUrl } from './url.js';
 import { DEFAULT_USER_AGENT } from './fetcher.js';
+import { validateCrawlerOptions } from './config.js';
 
 interface QueueItem {
   url: string;
   depth: number;
 }
 
-const DEFAULTS: Required<
-  Omit<CrawlerOptions, 'fetcher' | 'retry' | 'signal' | 'allowPrivateAddresses' | 'respectRobots'>
-> = {
-  maxPages: 10,
-  maxDepth: 2,
-  delayMs: 1000,
-  concurrency: 2,
-};
+/**
+ * An async gate that enforces minimum spacing between request starts.
+ *
+ * Workers call `acquire()` before issuing a request. The gate resolves only
+ * when at least `delayMs` has elapsed since the previous acquire, ensuring
+ * requests are spaced even under concurrency. A waiting queue (FIFO) guarantees
+ * ordering and avoids a thundering-herd race on the shared timestamp.
+ */
+class RateGate {
+  private nextAllowedTime = 0;
+  private waiters: Array<() => void> = [];
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly delayMs: number,
+    private readonly signal?: AbortSignal,
+  ) {}
+
+  async acquire(): Promise<void> {
+    // If the gate is free, claim it immediately.
+    if (this.waiters.length === 0 && Date.now() >= this.nextAllowedTime) {
+      this.nextAllowedTime = Date.now() + this.delayMs;
+      return;
+    }
+    // Otherwise queue and wait for our turn.
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        const idx = this.waiters.indexOf(resolve);
+        if (idx >= 0) this.waiters.splice(idx, 1);
+        reject(new Error('Aborted'));
+      };
+      if (this.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      this.waiters.push(resolve);
+      this.signal?.addEventListener('abort', onAbort, { once: true });
+      this.scheduleDrain();
+    });
+  }
+
+  private scheduleDrain(): void {
+    if (this.timer) return;
+    const wait = Math.max(0, this.nextAllowedTime - Date.now());
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.drain();
+    }, wait);
+    // NOTE: Do NOT unref this timer. The crawler's outer Promise resolves only
+    // when all workers finish; if the rate-gate timer were unref'd, Node could
+    // exit the event loop while workers are still waiting for their turn,
+    // causing a silent no-op exit. Keeping the timer ref'd ensures the process
+    // stays alive until the crawl completes or is aborted.
+  }
+
+  private drain(): void {
+    if (this.waiters.length === 0) return;
+    if (Date.now() < this.nextAllowedTime) {
+      this.scheduleDrain();
+      return;
+    }
+    // Release exactly one waiter (FIFO) and advance the next-allowed time.
+    const next = this.waiters.shift();
+    if (next) {
+      this.nextAllowedTime = Date.now() + this.delayMs;
+      next();
+    }
+    if (this.waiters.length > 0) this.scheduleDrain();
+  }
+}
 
 /**
  * Crawl a seed URL conservatively.
@@ -37,30 +102,29 @@ const DEFAULTS: Required<
  * same-origin links are crawled up to `maxDepth` and `maxPages`.
  */
 export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Promise<CrawlResult> {
-  const opts = { ...DEFAULTS, ...options };
+  const opts = validateCrawlerOptions(seedUrl, options);
   const seed = normalizeUrl(seedUrl);
   const fetcherOpts: FetcherOptions = {
     userAgent: options.fetcher?.userAgent ?? DEFAULT_USER_AGENT,
-    allowPrivateAddresses: options.allowPrivateAddresses ?? false,
-    signal: options.signal,
+    allowPrivateAddresses: opts.allowPrivateAddresses,
+    signal: opts.signal,
     ...options.fetcher,
   };
-
   const userAgent = fetcherOpts.userAgent ?? DEFAULT_USER_AGENT;
+
   const visited = new Set<string>();
   const pages: CrawledPage[] = [];
   const queue: QueueItem[] = [{ url: seed, depth: 0 }];
   let visitedCount = 0;
   let skipped = 0;
-  let running = 0;
+  let attempted = 0; // number of requests actually started (for diagnostics)
   const start = Date.now();
-
-  // Single-host request spacing. Because we only crawl same-origin, a single
-  // "nextAllowedTime" is sufficient to enforce politeness.
-  let nextAllowedTime = 0;
+  const gate = new RateGate(opts.delayMs, opts.signal);
 
   return new Promise<CrawlResult>((resolve) => {
     let resolved = false;
+    let running = 0;
+
     const finish = (): void => {
       if (resolved) return;
       resolved = true;
@@ -69,13 +133,25 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
         pages,
         visited: visitedCount,
         skipped,
+        attempted,
         durationMs: Date.now() - start,
       });
     };
 
+    const onAbort = (): void => {
+      if (resolved) return;
+      if (running === 0) {
+        finish();
+      }
+      // If workers are running, they will observe the signal and exit; finish()
+      // is called from their finally block when running reaches 0.
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+
     const schedule = (): void => {
-      if (opts.signal?.aborted) {
-        if (running === 0) finish();
+      if (resolved) return;
+      if (opts.signal?.aborted && running === 0) {
+        finish();
         return;
       }
       // Launch as many workers as concurrency allows, while there is work and
@@ -83,7 +159,8 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
       while (
         running < opts.concurrency &&
         queue.length > 0 &&
-        visitedCount + running < opts.maxPages
+        visitedCount + running < opts.maxPages &&
+        !opts.signal?.aborted
       ) {
         const item = queue.shift();
         if (!item) break;
@@ -97,23 +174,36 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
           continue;
         }
         running++;
-        void processItem(item).finally(() => {
-          running--;
-          if (running === 0) {
-            // No in-flight work. Stop when there is nothing left to do, when
-            // the page budget is spent, or when the crawl was cancelled.
-            if (queue.length === 0 || visitedCount >= opts.maxPages || opts.signal?.aborted) {
-              finish();
-            } else {
+        void processItem(item)
+          .catch((err) => {
+            // Should not happen — processItem catches internally — but guard
+            // against unhandled rejections so the process never dies silently.
+            pages.push({
+              url: item.url,
+              depth: item.depth,
+              status: 0,
+              metadata: null,
+              error: `unexpected worker error: ${(err as Error).message}`,
+            });
+            skipped++;
+          })
+          .finally(() => {
+            running--;
+            if (running === 0) {
+              if (queue.length === 0 || visitedCount >= opts.maxPages || opts.signal?.aborted) {
+                finish();
+              } else {
+                schedule();
+              }
+            } else if (queue.length > 0 && visitedCount < opts.maxPages && !opts.signal?.aborted) {
               schedule();
             }
-          } else if (queue.length > 0 && visitedCount < opts.maxPages) {
-            schedule();
-          }
-        });
+          });
       }
-      // If nothing is running and there is no schedulable work, we are done.
-      if (running === 0 && (queue.length === 0 || visitedCount >= opts.maxPages)) {
+      if (
+        running === 0 &&
+        (queue.length === 0 || visitedCount >= opts.maxPages || opts.signal?.aborted)
+      ) {
         finish();
       }
     };
@@ -129,9 +219,10 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
       visited.add(key);
 
       // robots.txt check.
-      if (options.respectRobots !== false) {
+      if (opts.respectRobots) {
         try {
           const robots = await loadRobots(item.url, fetcherOpts, { userAgent });
+          if (opts.signal?.aborted) return;
           if (!isAllowed(robots, item.url, userAgent)) {
             pages.push({
               url: item.url,
@@ -156,16 +247,19 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
         }
       }
 
-      // Enforce polite delay between requests.
-      const now = Date.now();
-      if (now < nextAllowedTime) {
-        await sleep(nextAllowedTime - now, opts.signal);
-        if (opts.signal?.aborted) return;
+      // Enforce polite spacing between request starts (across all workers).
+      try {
+        await gate.acquire();
+      } catch {
+        // Aborted while waiting.
+        return;
       }
-      nextAllowedTime = Date.now() + opts.delayMs;
+      if (opts.signal?.aborted || visitedCount >= opts.maxPages) return;
+      attempted++;
 
       try {
         const { value: doc } = await fetchPage(item.url, fetcherOpts, options.retry ?? {});
+        if (opts.signal?.aborted) return;
         if (visitedCount >= opts.maxPages) {
           skipped++;
           return;
@@ -187,6 +281,7 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
           }
         }
       } catch (err) {
+        if (opts.signal?.aborted) return;
         pages.push({
           url: item.url,
           depth: item.depth,
@@ -199,20 +294,5 @@ export async function crawl(seedUrl: string, options: CrawlerOptions = {}): Prom
     }
 
     schedule();
-  });
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
   });
 }

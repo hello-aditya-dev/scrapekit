@@ -46,15 +46,38 @@ Out of scope (by design):
 ScrapeKit ships with conservative defaults to protect both operators and target
 sites:
 
-- **Private/loopback addresses are blocked** by default to prevent SSRF.
-  Operators must opt in explicitly (`--allow-private`) for local testing.
+- **SSRF protection (two layers, best-effort):**
+  1. A _syntactic_ check of the URL host that blocks IPv4/IPv6 literals in
+     private ranges (RFC 1918, loopback, link-local, CGNAT, documentation,
+     benchmarking), `localhost`/`*.localhost` hostnames, `0.0.0.0`, and
+     IPv4-mapped IPv6 addresses.
+  2. A _DNS-resolution_ check that resolves the hostname via `node:dns` and
+     rejects the request if **any** returned address is non-public. This
+     catches hostnames that resolve to private IPs (e.g. `internal.corp`).
+     Redirects are checked at each hop. Operators must opt in explicitly
+     (`--allow-private`) for local testing.
+- **Response-body size limit** (5 MiB default, configurable via
+  `--max-body-bytes`) to prevent memory exhaustion from oversized responses.
 - **`robots.txt` is respected** by default. Disallowed paths are not crawled.
 - **Polite delays and bounded concurrency** are enforced with conservative
-  defaults.
+  defaults. A dedicated rate gate ensures request _starts_ are spaced by the
+  configured delay even under concurrency.
 - **Permanent client errors (`403`, `404`, …) are not retried** — only
   transient failures (`429`, `5xx`, timeouts, network errors).
 - A **descriptive User-Agent** identifies the tool and links to this
   repository.
 
-If you believe any of these defaults can be circumvented, please report it via
-the private channels above.
+### Residual SSRF risk (disclosed honestly)
+
+The DNS check is a **time-of-check** guard. Node's `fetch` does not expose a
+way to pin the resolved IP address at the socket layer, so a determined
+attacker with control of an authoritative DNS server could theoretically
+rebind the record between the check and the connection (DNS rebinding /
+TOCTOU). The implemented controls block the overwhelming majority of accidental
+and naive-malicious SSRF attempts, but this is **best-effort mitigation, not a
+complete SSRF defense**. Operators running ScrapeKit against untrusted
+user-supplied URLs in security-sensitive environments should layer additional
+network-level controls (egress firewalls, DNS pinning proxies).
+
+If you believe any of these defaults can be circumvented in a way that is
+exploitable in practice, please report it via the private channels above.

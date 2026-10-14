@@ -1,16 +1,61 @@
 /**
- * Shared CLI helpers: output writing and summary printing.
+ * Shared CLI helpers: output writing, summary printing, and argument parsing.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { ScrapeKitError } from '../types/index.js';
+import { ScrapeKitError, type ExportFormat } from '../types/index.js';
 import { toJson } from '../exporters/json.js';
 import { toCsv } from '../exporters/csv.js';
-import type { ExportFormat } from '../types/index.js';
 
 export interface OutputOptions {
   format: ExportFormat;
   output?: string;
+}
+
+/**
+ * Parse and strictly validate the --format option.
+ *
+ * Rejects unsupported values with a non-zero exit code instead of silently
+ * substituting JSON.
+ */
+export function parseFormat(value: unknown): ExportFormat {
+  if (value === 'json' || value === 'csv') return value;
+  process.stderr.write(`Error: --format must be "json" or "csv" (got "${value}").\n`);
+  process.exit(2);
+}
+
+/**
+ * Parse a non-negative integer option. Exits with code 2 on invalid input.
+ */
+export function parseNonNegInt(
+  value: unknown,
+  fallback: number,
+  flag: string,
+  max?: number,
+): number {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    process.stderr.write(`Error: ${flag} must be a non-negative integer (got "${value}").\n`);
+    process.exit(2);
+  }
+  if (max !== undefined && n > max) {
+    process.stderr.write(`Error: ${flag} must be <= ${max} (got "${value}").\n`);
+    process.exit(2);
+  }
+  return n;
+}
+
+/**
+ * Parse a strictly positive integer option (>= 1). Exits with code 2 on invalid input.
+ */
+export function parsePosInt(value: unknown, fallback: number, flag: string, max?: number): number {
+  const n = parseNonNegInt(value, fallback, flag, max);
+  if (n < 1) {
+    process.stderr.write(`Error: ${flag} must be >= 1 (got "${value}").\n`);
+    process.exit(2);
+  }
+  return n;
 }
 
 /**
