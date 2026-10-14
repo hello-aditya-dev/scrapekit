@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/hello-aditya-dev/scrapekit/actions/workflows/ci.yml/badge.svg)](https://github.com/hello-aditya-dev/scrapekit/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node](https://img.shields.io/badge/node-%3E%3D18.17-brightgreen)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
 
 **ScrapeKit** is a small, production-minded Node.js + TypeScript command-line
@@ -111,7 +111,7 @@ node dist/cli/index.js --help
 
 ### Requirements
 
-- Node.js `>= 18.17` (uses the global `fetch`).
+- Node.js `>= 20` (uses the global `fetch` and `File`).
 - npm or a compatible package manager.
 
 ## Quick start

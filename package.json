@@ -25,7 +25,7 @@
     "extractor"
   ],
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20"
   },
   "bin": {
     "scrapekit": "./dist/cli/index.js"

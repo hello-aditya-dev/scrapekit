@@ -15,7 +15,7 @@ npm install
 
 Requirements:
 
-- Node.js `>= 18.17` (the project uses the global `fetch`).
+- Node.js `>= 20` (the project uses the global `fetch` and `File`).
 - npm (a compatible package manager works too).
 
 ## Common scripts
