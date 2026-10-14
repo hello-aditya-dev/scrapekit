@@ -1,0 +1,73 @@
+{
+  "name": "scrapekit",
+  "version": "0.1.0",
+  "description": "Extract useful data from public websites. Responsibly, reliably, and without the boilerplate.",
+  "type": "module",
+  "license": "MIT",
+  "author": "hello-aditya-dev",
+  "homepage": "https://github.com/hello-aditya-dev/scrapekit",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hello-aditya-dev/scrapekit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hello-aditya-dev/scrapekit/issues"
+  },
+  "keywords": [
+    "web-scraping",
+    "typescript",
+    "nodejs",
+    "crawler",
+    "cheerio",
+    "cli",
+    "open-source",
+    "robots-txt",
+    "extractor"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "scrapekit": "./dist/cli/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "commander": "^12.1.0",
+    "robots-parser": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@typescript-eslint/eslint-plugin": "^8.21.0",
+    "@typescript-eslint/parser": "^8.21.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^10.0.1",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
